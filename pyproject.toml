@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openstartup-env"
+version = "0.1.0"
+description = "AI Startup Pivot Decision Simulator environment"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Disha Mathur" }
+]
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "openai",
+    "pyyaml",
+    "requests",
+    "openenv-core>=0.2.0"
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.setuptools]
+packages = ["server", "envs", "graders"]
+
+[tool.openenv]
+entrypoint = "server.app:main"

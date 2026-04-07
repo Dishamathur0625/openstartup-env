@@ -1,0 +1,23 @@
+name: openstartup-env
+description: A real-world startup strategy simulation environment where an AI agent acts as a founder and makes business decisions such as improving product, increasing marketing, reducing costs, pivoting, raising funding, or shutting down.
+version: 0.1.0
+entrypoint: server/app.py
+
+tasks:
+  - easy_stable_growth
+  - medium_competition_pressure
+  - hard_pivot_or_die
+
+metadata:
+  domain: business
+  tags:
+    - openenv
+    - startup
+    - business-strategy
+    - reinforcement-learning
+    - decision-making
+
+models:
+  observation: StartupObservation
+  action: StartupAction
+  reward: StartupReward
