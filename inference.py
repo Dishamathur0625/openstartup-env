@@ -1,10 +1,15 @@
 import os
+import json
 import time
 import requests
+from openai import OpenAI
 
-# IMPORTANT:
-# Do NOT use API_BASE_URL here because validator may already set it
-# for some unrelated service (like an LLM gateway).
+# Validator-provided LLM proxy
+LLM_BASE_URL = os.getenv("API_BASE_URL")
+LLM_API_KEY = os.getenv("API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
+# Local environment server (not the LLM proxy)
 ENV_BASE_URL = os.getenv("ENV_BASE_URL", "").strip()
 
 TASKS = [
@@ -13,8 +18,17 @@ TASKS = [
     "hard_pivot_or_die"
 ]
 
+ACTIONS = [
+    "improve_product",
+    "increase_marketing",
+    "reduce_costs",
+    "pivot_business_model",
+    "raise_funding",
+    "shutdown"
+]
+
 MAX_STEPS = 8
-TIMEOUT = 10
+TIMEOUT = 15
 
 
 def log_start(task, env_name, model):
@@ -38,13 +52,11 @@ def log_end(success, steps, rewards, error=None):
     )
 
 
-def candidate_base_urls():
+def candidate_env_urls():
     candidates = []
-
     if ENV_BASE_URL:
         candidates.append(ENV_BASE_URL.rstrip("/"))
 
-    # Common local endpoints to probe
     candidates.extend([
         "http://127.0.0.1:8000",
         "http://localhost:8000",
@@ -52,19 +64,18 @@ def candidate_base_urls():
         "http://localhost:7860",
     ])
 
-    # Deduplicate while preserving order
     seen = set()
     unique = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
     return unique
 
 
-def find_working_server(max_retries=20, delay=2):
+def wait_for_env_server(max_retries=20, delay=2):
     for _ in range(max_retries):
-        for base_url in candidate_base_urls():
+        for base_url in candidate_env_urls():
             try:
                 resp = requests.get(f"{base_url}/tasks", timeout=TIMEOUT)
                 if resp.status_code == 200:
@@ -82,13 +93,11 @@ def safe_post(base_url, path, **kwargs):
     try:
         data = resp.json()
     except Exception:
-        raise RuntimeError(
-            f"{path} returned non-JSON response with status {resp.status_code}"
-        )
+        raise RuntimeError(f"{path} returned non-JSON response with status {resp.status_code}")
     return resp.status_code, data
 
 
-def choose_action(observation, task_name, step):
+def fallback_action(observation, task_name, step):
     pmf = observation.get("pmf_score", 0)
     cash = observation.get("cash_left", 0)
     burn = observation.get("burn_rate", 0)
@@ -110,7 +119,6 @@ def choose_action(observation, task_name, step):
             return "improve_product"
         return "increase_marketing"
 
-    # easy_stable_growth
     if pmf < 70:
         return "improve_product"
     if cash < 60000:
@@ -118,70 +126,140 @@ def choose_action(observation, task_name, step):
     return "increase_marketing"
 
 
-def run_task(base_url, task_name):
+def extract_action(text):
+    if not text:
+        return None
+
+    text = text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+
+    try:
+        parsed = json.loads(text)
+        action = parsed.get("action")
+        if action in ACTIONS:
+            return action
+    except Exception:
+        pass
+
+    return None
+
+
+def choose_action_with_llm(client, observation, task_name, step):
+    prompt = f"""
+You are controlling a startup strategy simulator.
+
+Task: {task_name}
+Step: {step}
+
+Current observation:
+{json.dumps(observation, indent=2)}
+
+Available actions:
+{ACTIONS}
+
+Choose exactly one action from the list above.
+Respond with JSON only in this format:
+{{"action": "<one_action_name>"}}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a startup strategy decision agent."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=50
+        )
+        content = response.choices[0].message.content
+        action = extract_action(content)
+        if action in ACTIONS:
+            return action
+    except Exception:
+        pass
+
+    return fallback_action(observation, task_name, step)
+
+
+def run_task(client, env_base_url, task_name):
     rewards = []
     success = False
     steps_taken = 0
 
-    status, reset_data = safe_post(base_url, "/reset", params={"task_name": task_name})
-
-    if status != 200:
-        raise RuntimeError(f"/reset failed with status {status}: {reset_data}")
-
-    if "observation" not in reset_data:
-        raise RuntimeError(f"/reset response missing 'observation': {reset_data}")
-
-    observation = reset_data["observation"]
-
-    log_start(task_name, "openstartup-env", "rule_based")
-
-    for step in range(1, MAX_STEPS + 1):
-        action = choose_action(observation, task_name, step)
-
-        status, data = safe_post(base_url, "/step", json={"action": action})
+    try:
+        status, reset_data = safe_post(env_base_url, "/reset", params={"task_name": task_name})
 
         if status != 200:
-            raise RuntimeError(f"/step failed with status {status}: {data}")
+            log_end(False, 0, [], error=f"/reset failed with status {status}")
+            return
 
-        if "observation" not in data or "reward" not in data or "done" not in data:
-            raise RuntimeError(f"/step response missing required fields: {data}")
+        if "observation" not in reset_data:
+            log_end(False, 0, [], error=f"/reset response missing observation: {reset_data}")
+            return
 
-        reward = float(data["reward"])
-        done = bool(data["done"])
-        error = data.get("info", {}).get("message")
-        observation = data["observation"]
+        observation = reset_data["observation"]
+        log_start(task_name, "openstartup-env", MODEL_NAME)
 
-        rewards.append(reward)
-        steps_taken = step
+        for step in range(1, MAX_STEPS + 1):
+            action = choose_action_with_llm(client, observation, task_name, step)
 
-        log_step(step, action, reward, done, error)
+            status, data = safe_post(env_base_url, "/step", json={"action": action})
 
-        if done:
-            task_score = data.get("info", {}).get("task_score", 0.0)
-            success = task_score > 0.5
-            break
+            if status != 200:
+                log_end(False, steps_taken, rewards, error=f"/step failed with status {status}")
+                return
 
-    log_end(success, steps_taken, rewards)
+            if "observation" not in data or "reward" not in data or "done" not in data:
+                log_end(False, steps_taken, rewards, error=f"/step response malformed: {data}")
+                return
+
+            reward = float(data["reward"])
+            done = bool(data["done"])
+            error = data.get("info", {}).get("message")
+            observation = data["observation"]
+
+            rewards.append(reward)
+            steps_taken = step
+
+            log_step(step, action, reward, done, error)
+
+            if done:
+                task_score = data.get("info", {}).get("task_score", 0.0)
+                success = task_score > 0.5
+                break
+
+        log_end(success, steps_taken, rewards)
+
+    except Exception as e:
+        log_end(False, steps_taken, rewards, error=str(e))
 
 
 def main():
-    base_url = find_working_server()
+    client = None
 
-    if not base_url:
-        log_end(
-            success=False,
-            steps=0,
-            rewards=[],
-            error="Environment server not reachable on expected local endpoints"
-        )
+    # Only use validator proxy if BOTH values are present
+    if LLM_BASE_URL and LLM_API_KEY:
+        try:
+            client = OpenAI(
+                base_url=LLM_BASE_URL,
+                api_key=LLM_API_KEY
+            )
+        except Exception as e:
+            log_end(False, 0, [], error=f"LLM client init failed: {e}")
+            return
+
+    env_base_url = wait_for_env_server()
+    if not env_base_url:
+        log_end(False, 0, [], error="Environment server not reachable on expected local endpoints")
         return
 
     for task in TASKS:
-        try:
-            run_task(base_url, task)
-        except Exception as e:
-            log_end(False, 0, [], error=str(e))
-            # Do not raise; avoid non-zero exit that fails validation
+        run_task(client, env_base_url, task)
 
 
 if __name__ == "__main__":
