@@ -3,11 +3,7 @@ EPS_MAX = 0.99
 
 
 def clamp_score(score: float) -> float:
-    if score <= 0:
-        return EPS_MIN
-    if score >= 1:
-        return EPS_MAX
-    return round(score, 2)
+    return max(EPS_MIN, min(EPS_MAX, round(score, 2)))
 
 
 def grade_easy(initial_state, final_state, history):
