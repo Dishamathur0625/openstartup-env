@@ -1,3 +1,15 @@
+EPS_MIN = 0.01
+EPS_MAX = 0.99
+
+
+def clamp_score(score: float) -> float:
+    if score <= 0:
+        return EPS_MIN
+    if score >= 1:
+        return EPS_MAX
+    return round(score, 2)
+
+
 def grade_easy(initial_state, final_state, history):
     score = 0.0
 
@@ -12,7 +24,7 @@ def grade_easy(initial_state, final_state, history):
     if "shutdown" not in history:
         score += 0.10
 
-    return round(min(score, 1.0), 2)
+    return clamp_score(score)
 
 
 def grade_medium(initial_state, final_state, history):
@@ -29,7 +41,7 @@ def grade_medium(initial_state, final_state, history):
     if final_state["pmf_score"] > initial_state["pmf_score"]:
         score += 0.20
 
-    return round(min(score, 1.0), 2)
+    return clamp_score(score)
 
 
 def grade_hard(initial_state, final_state, history):
@@ -48,7 +60,7 @@ def grade_hard(initial_state, final_state, history):
     if final_state["users"] > initial_state["users"]:
         score += 0.15
 
-    return round(min(score, 1.0), 2)
+    return clamp_score(score)
 
 
 def grade_task(task_name, initial_state, final_state, history):
@@ -59,4 +71,4 @@ def grade_task(task_name, initial_state, final_state, history):
     elif task_name == "hard_pivot_or_die":
         return grade_hard(initial_state, final_state, history)
     else:
-        return 0.0
+        return EPS_MIN
