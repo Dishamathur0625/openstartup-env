@@ -1,12 +1,8 @@
 import os
-import json
+import time
 import requests
-from openai import OpenAI
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
 
 TASKS = [
     "easy_stable_growth",
@@ -14,16 +10,8 @@ TASKS = [
     "hard_pivot_or_die"
 ]
 
-ACTIONS = [
-    "improve_product",
-    "increase_marketing",
-    "reduce_costs",
-    "pivot_business_model",
-    "raise_funding",
-    "shutdown"
-]
-
 MAX_STEPS = 8
+TIMEOUT = 15
 
 
 def log_start(task, env_name, model):
@@ -43,65 +31,85 @@ def log_end(success, steps, rewards):
     print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}", flush=True)
 
 
-def choose_action_with_llm(client, observation, task_name):
-    prompt = f"""
-You are controlling a startup strategy simulator.
+def wait_for_server(max_retries=20, delay=2):
+    for _ in range(max_retries):
+        try:
+            resp = requests.get(f"{API_BASE_URL}/tasks", timeout=TIMEOUT)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "available_tasks" in data:
+                    return True
+        except Exception:
+            pass
+        time.sleep(delay)
+    return False
 
-Task: {task_name}
 
-Current observation:
-{json.dumps(observation, indent=2)}
-
-Available actions:
-{ACTIONS}
-
-Choose exactly one action from the list above.
-Respond with JSON only in this format:
-{{"action": "<one_action_name>"}}
-"""
-
+def safe_post(path, **kwargs):
+    resp = requests.post(f"{API_BASE_URL}{path}", timeout=TIMEOUT, **kwargs)
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a startup strategy decision agent."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=50
-        )
-        content = response.choices[0].message.content.strip()
-        parsed = json.loads(content)
-        action = parsed.get("action", "reduce_costs")
-        if action not in ACTIONS:
-            return "reduce_costs"
-        return action
+        data = resp.json()
     except Exception:
+        raise RuntimeError(f"{path} returned non-JSON response with status {resp.status_code}")
+    return resp.status_code, data
+
+
+def choose_action(observation, task_name, step):
+    pmf = observation.get("pmf_score", 0)
+    cash = observation.get("cash_left", 0)
+    burn = observation.get("burn_rate", 0)
+    revenue = observation.get("revenue", 0)
+
+    if task_name == "hard_pivot_or_die":
+        if step == 1 and pmf < 50:
+            return "pivot_business_model"
+        if pmf < 65:
+            return "improve_product"
+        if cash < 80000:
+            return "reduce_costs"
+        return "increase_marketing"
+
+    if task_name == "medium_competition_pressure":
+        if cash < 70000 or burn > revenue * 1.2:
+            return "reduce_costs"
+        if pmf < 60:
+            return "improve_product"
+        return "increase_marketing"
+
+    if pmf < 70:
+        return "improve_product"
+    if cash < 60000:
         return "reduce_costs"
+    return "increase_marketing"
 
 
-def run_task(client, task_name):
+def run_task(task_name):
     rewards = []
     success = False
     steps_taken = 0
 
-    reset_resp = requests.post(
-        f"{API_BASE_URL}/reset",
-        params={"task_name": task_name}
-    )
-    reset_data = reset_resp.json()
+    status, reset_data = safe_post("/reset", params={"task_name": task_name})
+
+    if status != 200:
+        raise RuntimeError(f"/reset failed with status {status}: {reset_data}")
+
+    if "observation" not in reset_data:
+        raise RuntimeError(f"/reset response missing 'observation': {reset_data}")
+
     observation = reset_data["observation"]
 
-    log_start(task_name, "openstartup-env", MODEL_NAME)
+    log_start(task_name, "openstartup-env", "rule_based")
 
     for step in range(1, MAX_STEPS + 1):
-        action = choose_action_with_llm(client, observation, task_name)
+        action = choose_action(observation, task_name, step)
 
-        resp = requests.post(
-            f"{API_BASE_URL}/step",
-            json={"action": action}
-        )
-        data = resp.json()
+        status, data = safe_post("/step", json={"action": action})
+
+        if status != 200:
+            raise RuntimeError(f"/step failed with status {status}: {data}")
+
+        if "observation" not in data or "reward" not in data or "done" not in data:
+            raise RuntimeError(f"/step response missing required fields: {data}")
 
         reward = float(data["reward"])
         done = bool(data["done"])
@@ -122,10 +130,8 @@ def run_task(client, task_name):
 
 
 if __name__ == "__main__":
-    client = OpenAI(
-        base_url=LLM_BASE_URL,
-        api_key=HF_TOKEN
-    )
+    if not wait_for_server():
+        raise RuntimeError(f"Environment server not reachable at {API_BASE_URL}")
 
     for task in TASKS:
-        run_task(client, task)
+        run_task(task)
