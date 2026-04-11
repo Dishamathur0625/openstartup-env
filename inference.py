@@ -43,11 +43,11 @@ def log_step(step, action, reward, done, error):
     )
 
 
-def log_end(success, steps, rewards, error=None):
+def log_end(success, steps, rewards, score, error=None):
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     extra = f" error={error}" if error else ""
     print(
-        f"[END] success={str(success).lower()} steps={steps} rewards={rewards_str}{extra}",
+        f"[END] success={str(success).lower()} steps={steps} score={score:.2f} rewards={rewards_str}{extra}",
         flush=True
     )
 
@@ -229,11 +229,12 @@ def run_task(client, env_base_url, task_name):
             log_step(step, action, reward, done, error)
 
             if done:
-                task_score = data.get("info", {}).get("task_score", 0.0)
+                task_score = data.get("info", {}).get("task_score", 0.01)
+                task_score = max(0.01, min(0.99, task_score))
                 success = task_score > 0.5
                 break
 
-        log_end(success, steps_taken, rewards)
+        log_end(success, steps_taken, rewards, task_score)
 
     except Exception as e:
         log_end(False, steps_taken, rewards, error=str(e))
